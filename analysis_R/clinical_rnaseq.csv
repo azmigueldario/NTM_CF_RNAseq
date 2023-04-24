@@ -1,0 +1,43 @@
+CFB_study_id,mycobacteria_species,CF_related_disorder,transplant,female,cftr_modulator,chronic_aspergillus,chronic_pseudomonas,cat_genotype,batch_extraction,ntm_disease,transient_inf,rna_growth_window,rna_disease_window,rna_disease_interval,rna_growth_interval,age_cat
+CFB2001,MABs,No,No,No,No,No,No,F508del.heterozygous,5,Yes,No,"After culture, NTM-PD",<= 40 months,-34.1,36.5,25 to < 35
+CFB2006,MABs,No,No,No,No,No,No,others,4,No,No,Before culture,NA,NA,-7.2,18 to < 25
+CFB2007,MABs,No,No,No,No,No,No,F508del.heterozygous,4,No,No,"After culture, no NTM-PD",NA,NA,6.9,25 to < 35
+CFB2009,MAC,No,No,No,No,NA,NA,others,4,No,No,"After culture, no NTM-PD",NA,NA,49.6,Under 18
+CFB2039,MAC,No,No,No,No,Yes,No,others,4,No,No,"After culture, no NTM-PD",NA,NA,9.5,18 to < 25
+CFB2044,MABs,No,No,No,No,No,Yes,F508del.homozygous,4,No,No,"After culture, no NTM-PD",NA,NA,110.3,18 to < 25
+CFB2059,MABs,No,No,No,No,No,Yes,F508del.heterozygous,4,No,No,Before culture,NA,NA,0,50 or more
+CFB2075,MAC,No,No,Yes,No,Yes,No,F508del.heterozygous,3,No,No,Before culture,NA,NA,0,35 to < 50
+CFB2045,MAC,No,No,Yes,No,No,Yes,F508del.heterozygous,4,Yes,No,"After culture, NTM-PD",<= 40 months,12,1.8,18 to < 25
+CFB2049,MABs,No,No,Yes,No,NA,NA,F508del.heterozygous,4,Yes,No,"After culture, NTM-PD",> 40 months,79.1,119.9,Under 18
+CFB2082,other,No,No,No,No,No,No,F508del.homozygous,4,No,No,Before culture,NA,NA,-2.5,18 to < 25
+CFB2088,other,No,No,No,Yes,Yes,No,F508del.homozygous,1,No,No,"After culture, no NTM-PD",NA,NA,6,35 to < 50
+CFB2060,MABs,No,No,No,No,Yes,Yes,F508del.homozygous,2,Yes,No,"After culture, NTM-PD",<= 40 months,16.3,1.8,35 to < 50
+CFB2061,MAC,No,No,Yes,No,NA,NA,F508del.homozygous,4,Yes,No,"After culture, NTM-PD",> 40 months,-46.6,63.8,Under 18
+CFB2102,MAC,No,No,No,No,Yes,Yes,F508del.homozygous,3,No,No,"After culture, no NTM-PD",NA,NA,39.6,50 or more
+CFB2071,MAC,No,No,No,No,No,No,others,3,Yes,No,"After culture, NTM-PD",> 40 months,55.4,108.5,18 to < 25
+CFB2108,MAC,No,No,No,No,No,Yes,F508del.homozygous,4,No,No,"After culture, no NTM-PD",NA,NA,3.4,25 to < 35
+CFB2138,MAC,Yes,No,Yes,No,No,No,F508del.heterozygous,3,No,No,"After culture, no NTM-PD",NA,NA,4.7,35 to < 50
+CFB2140,MAC,No,No,No,No,No,No,F508del.heterozygous,2,No,No,"After culture, no NTM-PD",NA,NA,33.2,35 to < 50
+CFB2152,MAC,No,No,No,No,No,Yes,F508del.heterozygous,2,No,No,"After culture, no NTM-PD",NA,NA,171.4,18 to < 25
+CFB2084,MAC,No,No,No,No,No,No,F508del.homozygous,4,Yes,No,"After culture, NTM-PD",> 40 months,-52,59.6,18 to < 25
+CFB2166,MABs,No,No,Yes,No,No,No,others,2,No,No,"After culture, no NTM-PD",NA,NA,22.6,18 to < 25
+CFB2169,MAC,No,No,No,No,No,Yes,F508del.homozygous,1,No,No,"After culture, no NTM-PD",NA,NA,5.6,18 to < 25
+CFB2098,MAC,No,No,Yes,No,Yes,No,F508del.homozygous,2,Yes,No,"After culture, NTM-PD",> 40 months,-55.4,58.6,25 to < 35
+CFB2171,MAC,No,No,No,No,No,No,others,1,No,No,"After culture, no NTM-PD",NA,NA,25.6,18 to < 25
+CFB2105,MAC,No,No,No,No,Yes,No,F508del.homozygous,4,Yes,No,"After culture, NTM-PD",> 40 months,-60.5,76.5,Under 18
+CFB2186,MAC,No,No,No,No,No,No,F508del.heterozygous,1,No,No,"After culture, no NTM-PD",NA,NA,106.5,25 to < 35
+CFB2013,MABs,No,No,No,No,No,Yes,F508del.heterozygous,4,No,Yes,"After culture, no NTM-PD",NA,NA,17.3,25 to < 35
+CFB2022,MAC,No,No,No,Yes,No,No,others,4,No,Yes,"After culture, no NTM-PD",NA,NA,137.6,25 to < 35
+CFB2128,MAC,No,No,No,No,No,No,F508del.heterozygous,3,Yes,No,"After culture, NTM-PD",<= 40 months,-37.5,37.5,Under 18
+CFB2058,MAC,No,No,No,No,No,No,F508del.homozygous,3,No,Yes,"After culture, no NTM-PD",NA,NA,35.2,18 to < 25
+CFB2074,MAC,No,No,No,No,Yes,Yes,F508del.heterozygous,5,No,Yes,"After culture, no NTM-PD",NA,NA,15.6,25 to < 35
+CFB2087,MAC,No,No,Yes,No,Yes,No,F508del.heterozygous,3,No,Yes,"After culture, no NTM-PD",NA,NA,117.7,25 to < 35
+CFB2112,other,No,No,Yes,No,Yes,No,F508del.heterozygous,1,No,Yes,Before culture,NA,NA,-8.8,25 to < 35
+CFB2127,other,No,No,Yes,No,No,Yes,F508del.heterozygous,4,No,Yes,"After culture, no NTM-PD",NA,NA,18.9,25 to < 35
+CFB2159,MABs,No,No,No,No,NA,NA,F508del.heterozygous,2,Yes,No,"After culture, NTM-PD",<= 40 months,31.6,32.6,18 to < 25
+CFB2134,other,No,No,No,No,Yes,No,F508del.homozygous,3,No,Yes,"After culture, no NTM-PD",NA,NA,2.8,25 to < 35
+CFB2163,MABs,No,No,No,Yes,Yes,Yes,F508del.homozygous,1,Yes,No,Before culture,<= 40 months,2,0,35 to < 50
+CFB2142,other,No,No,Yes,No,No,Yes,F508del.homozygous,1,No,Yes,Before culture,NA,NA,-15.2,25 to < 35
+CFB2146,other,No,No,Yes,No,No,Yes,F508del.homozygous,2,No,Yes,Before culture,NA,NA,0,25 to < 35
+CFB2149,MABs,No,No,Yes,Yes,No,Yes,F508del.homozygous,1,No,Yes,"After culture, no NTM-PD",NA,NA,169.6,18 to < 25
+CFB2160,other,No,No,No,No,No,No,F508del.heterozygous,2,No,Yes,Before culture,NA,NA,-4.5,18 to < 25
