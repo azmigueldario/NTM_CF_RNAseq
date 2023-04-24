@@ -1,0 +1,1195 @@
+---
+title: "Differential gene expression DESeq2"
+author: "MDP"
+output: 
+  html_document:
+    toc: true
+    theme: flatly
+    toc_depth: 3
+    number_sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+## Aims
+
+1.  Prepare the analysis dataset (includes phenotypic and count data)
+2.  Annotate the genes in the dataset using Ensembl databases
+3.  Perform exploratory analysis of the gene expression to evaluate:
+    -   Grouping of data in principal component analysis (PCA)
+    -   Filtering outlier features 
+4.  Perform differential gene expression using DESeq2 on filtered data set
+5.  Explore concordance with results of NTM associated gene expression in other populations (Cowman et al)
+
+## Install and load Bioconductor/Packages
+
+The analysis was performed with Bioconductor `version 3.13` and R `version 4.1` and later
+
+The following code installs all necessary packages for the initial steps:
+
+```{r, eval=FALSE}
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+  }
+BiocManager::install(version = "3.16")
+
+BiocManager::install(c("DESeq2", "apeglm", "sva", "PCAtools", "ensembldb", 
+                       "AnnotationHub", "tximport"))
+```
+
+If they are available, we just have to load them with the following code
+
+```{r}
+temp_objects <-  list()
+
+temp_objects$packages = c("tximport", "AnnotationHub", "ensembldb", 
+                          "tidyverse", "sva", "DESeq2", 
+                          "kableExtra", "ggpubr", "ggrepel", 
+                          "ggvenn", "flextable")
+
+lapply(temp_objects$packages, library, character.only = T)
+```
+
+## Load count data
+
+Count data from **RSEM (software)** has suffix `genes.results`. Can be gzipped for easier transmission
+
+-   Create a vector with all files with the `genes.results` suffix and assign the `CFB_study_id (CFB2XXX)` as vector names
+-   Verify existence of all 42 files
+
+```{r}
+# merge path and file names
+temp_objects$genes_filepaths <-
+  list.files("./rsem_counts",
+             # includes path
+             full.names = T) %>%    
+  grep(pattern = "*genes.results",
+       value = T) %>%               
+  # set names CFBXXXX to each value in vector
+  setNames(.,
+           nm = str_extract(., "CFB[0-9]+"))
+
+# evaluate if files exist
+all(file.exists(temp_objects$genes_filepaths))
+length(temp_objects$genes_filepaths)
+```
+
+-   Create dataframe of names starting with `CFBXXXX` pattern to match with rest of data
+
+```{r}
+temp_objects$CFB_study_id <-
+  str_extract(temp_objects$genes_filepaths, 
+              "CFB[0-9]+") %>%
+  data.frame(CFB_study_id = .)
+```
+
+## Create count matrix
+
+-   Load the `gene.results` files into R using the `tximport()` function.
+-   `txIn=F | txOut=F` indicates that we import and export at the gene level as resolved by **RSEM**
+
+```{r Counts for DESeq2}
+temp_objects$rsem_tximport <- 
+  tximport(temp_objects$genes_filepaths,
+           type = "rsem",
+           txIn = FALSE, txOut = FALSE,
+           ignoreTxVersion = TRUE)
+
+head(temp_objects$rsem_tximport$counts)
+```
+
+## Importing subject level data
+
+-   Import subject metadata from *exploratory_clinical_demographic.rmd*
+-   Assign `CFB_study_id` to rownames, so it matches colnames(counts)
+
+```{r Import subject metadata}
+
+# ------------- Load clinical and pulmonary function datasets
+
+temp_objects$clinical <-
+  read_csv(file = "./clinical_rnaseq.csv") %>%
+  # select only relevant clinical variables
+  select(CFB_study_id, mycobacteria_species,  
+         age_cat, female, batch_extraction, ntm_disease,
+         rna_growth_window, rna_disease_window, rna_disease_interval)
+
+# ------------- Merge clinical and fev data
+
+# then, inner join according to CFB_study_id for n = 42 subjectss
+temp_objects$subject_data <- 
+  inner_join(temp_objects$CFB_study_id,
+             temp_objects$clinical,
+             by = "CFB_study_id") %>% 
+  mutate(across(where(is.character), 
+                as_factor)) %>%
+  mutate(batch_extraction = factor(batch_extraction),
+         # Recode ntm disease to facilitate direction of analysis
+         ntm_disease = factor(ntm_disease, 
+                              levels = c("No", "Yes")))
+
+# assign IDs to rownames
+rownames(temp_objects$subject_data) <- temp_objects$subject_data$CFB_study_id
+
+# make sure the rownames(subject_data) match colnames (count_data)
+all(colnames(temp_objects$rsem_tximport$counts) %in% rownames(temp_objects$subject_data))
+```
+
+For sensitivity analysis, I create a vector of samples to exclude after NTM-PD diagnosis
+
+```{r vector of samples to exclude}
+ntmpd_before_sampling <- 
+  temp_objects$clinical  %>%
+  filter(ntm_disease == "Yes") %>%
+  filter(rna_disease_interval < 0 ) %>% 
+  select(CFB_study_id) %>%
+  pull()
+```
+
+## Create DEseq2 dataset
+
+-   Gene lengths must be $>0$ in DESeq so I replac any $0$ value with 1
+-   The design specifies the analytical dependency of data or the outcome (s) to be evaluated. Can be modified later.
+
+```{r}
+temp_objects$rsem_tximport$length[temp_objects$rsem_tximport$length == 0] <- 1
+
+initial_dds <- DESeqDataSetFromTximport(txi = temp_objects$rsem_tximport,
+                                        colData = temp_objects$subject_data,
+                                        design = ~ntm_disease)
+```
+
+## Wrapper functions
+
+Creates commonly used functions during analysis including production of tables (grouped or not) with proportions. Also, produces nicely formatted table with **flextable** and a wrapper function that produces a table of differentially expressed genes.
+
+```{r, echo=FALSE}
+
+# --------------- kable wrapper
+
+kable_wrapper <- function(data, col.names = NA,
+                          fontsize = 20, num_digits = 3) {
+  
+  # --------------------------- Produce table 
+  df <- data
+  tab <- kbl(x = df,
+             format = "html",
+             align = "c",
+             colnames = col.names,
+             digits = num_digits)
+  
+  # --------------------------- Adjust aesthetics
+  tab <- tab %>%
+    kable_classic() %>%
+    kable_styling(bootstrap_options = "striped",
+                  font_size = fontsize,
+                  full_width = F)
+  tab %>%
+    row_spec(row = 0, bold = T)
+}
+
+# -------------- formatted table (flextable)
+
+flextable_wrapper <- function(data,
+                              fontsize = 14,
+                              digits = 4,
+                              names_col = colnames(data)){
+  ### ---------- sanity checks
+  if (!is.data.frame(data))   warning("data must be data.frame like!")
+  if (!is.vector(names_col)) stop("names_col must be a character vector!")
+  
+  ### ---------- programming
+  df <- data
+  colnames(df) <-  names_col
+  tab <- flextable(df)
+  tab <- tab %>% 
+    theme_zebra() %>%
+    colformat_double(decimal.mark = ".", digits = digits)
+  tab <- tab %>% 
+    fontsize(size = fontsize, part = "all") %>% 
+    align(j = -1, align = "center", part = "all") %>%
+    autofit()
+  tab
+}
+
+
+# ------------- DESeq2 results cleaner
+
+
+res_cleaner <- function(data,
+                        cutoff = 0.3,
+                        annotation = annotation_dat,
+                        sort.by = padj) {
+  ### -------- Error check
+  if (is.data.frame(data)) stop("input data is a data.frame, use tidy=F in results call")
+  
+  ### -------- Instructions
+  df <- data.frame(data)
+  
+  # save rownames in a column to match annotation data
+  df <- df %>%
+    rownames_to_column("GENEID")
+  
+  # create new data.frame that includes annotation data, matched by GENEID
+  df <- df %>%
+    filter(padj < cutoff) %>%
+    inner_join(x = .,
+               y = annotation_dat,
+               by = "GENEID")
+  
+  # select relevant variables for table only
+  df %>%
+    select(c(SYMBOL, GENEID, ENTREZID, log2FoldChange, pvalue, padj, stat, DESCRIPTION, baseMean)) %>%
+    # start with symbol
+    relocate(SYMBOL) %>%
+    # sort according to specified variable, default=padj
+    arrange({{ sort.by }})
+}
+```
+
+# Annotation
+
+## Clean rownames
+
+-   Genes with suffix `_PAR_Y` (pseudoautosomal Chrom-Y) are not commonly expressed, so we remove them.
+-   To annotate, we transform gene identifiers from GENEIDVERSION ("ENSG00005.6") to GENEID ("ENSG00005")
+
+```{r}
+
+dim(initial_dds)
+
+temp_objects$no_parY_dds <-
+  # invert=T returns not matching
+  grep("_PAR_Y", rownames(initial_dds), value = T, invert = T) %>%
+  initial_dds[., ]
+
+dim(temp_objects$no_parY_dds)
+
+# GENEIDVERSION to GENEID
+rownames(temp_objects$no_parY_dds) <- 
+  rownames(temp_objects$no_parY_dds) %>%
+  sub("\\..*", "", x = .)
+
+rownames(initial_dds)[1:5] ; rownames(temp_objects$no_parY_dds)[1:5]
+```
+
+## Create annotation dataframe
+
+Our reference genome is from GENCODE (GRCh38.p13_v38), so we use the current Ensemble database (EnsDb_v104) available in R
+
+```{r}
+# load annotation hub resources from BioConductor
+temp_objects$hub <-   AnnotationHub()
+
+# We search and load the necessary database for annotation
+# ------   query(temp$hub, c("EnsDb","Homo sapiens")) 
+temp_objects$EnsDb_v104 <- temp_objects$hub[["AH95744"]]
+```
+
+-   We use *GENEID* as matching *key* to extract necessary *columns* from EnsDb.
+-   The *GCCONTENT* column is added individually with `mapIds` to avoid multiple matching of the same key due to isoforms.
+-   We create indicator (yes/no) variables for **hemoglobin subunit** genes
+
+```{r extract annotation information}
+columns(temp_objects$EnsDb_v104)
+
+# ensembl IDs are used as key for search
+temp_objects$keys <-   rownames(temp_objects$no_parY_dds)
+
+# extract annotation data
+annotation_dat <- ensembldb::select(temp_objects$EnsDb_v104,
+                                    keys = temp_objects$keys,
+                                    keytype = "GENEID",
+                                    columns = c("GENEID", "SYMBOL", "DESCRIPTION", "GENEBIOTYPE","SEQNAME"))
+
+# adding GC content
+annotation_dat$GCCONTENT <-   mapIds(temp_objects$EnsDb_v104,
+                                     keys = temp_objects$keys,
+                                     column = "GCCONTENT",
+                                     keytype = "GENEID",
+                                     multiVals = "first")
+
+annotation_dat$ENTREZID <-   mapIds(temp_objects$EnsDb_v104,
+                                    keys = temp_objects$keys,
+                                    column = "ENTREZID",
+                                    keytype = "GENEID",
+                                    multiVals = "first")
+
+# should have no duplicates
+annotation_dat[duplicated(annotation_dat$GENEID), ]
+
+# creates indicator variable for hemoglobin subunits
+annotation_dat <- 
+  annotation_dat %>%
+  mutate(hemoglobin = grepl("hemoglobin sub", DESCRIPTION),
+         DESCRIPTION = gsub("\\[.*\\]", "", DESCRIPTION))
+```
+
+## Annotate DESeq2dataset
+
+-   Given that rownames and *GENEID* match perfectly, we can just add the annotation using `mcols()`
+
+```{r}
+all(rownames(temp_objects$no_parY_dds) == annotation_dat$GENEID)
+annotated_dds <- temp_objects$no_parY_dds
+mcols(annotated_dds) <- annotation_dat
+```
+
+# Filtering steps
+
+## Expression of globin subunits
+
+-   Create a copy of our working dataset with *SYMBOL* as rowname
+
+-   Print top read counts `(rowSums)`, hemoglobin sub-units represent substantial outliers.
+
+```{r, eval=FALSE, include=FALSE, echo=FALSE}
+temp_objects$globin_dds <-   annotated_dds
+rownames(temp_objects$globin_dds) <-   annotation_dat$SYMBOL
+
+subset(temp_objects$globin_dds, 
+       subset = hemoglobin == T) %>%
+  counts() %>%
+  rowSums() %>%
+  sort(decreasing = T)
+
+counts(temp_objects$globin_dds) %>%
+  rowSums() %>%
+  sort(decreasing = T) %>%
+  head(20)
+```
+
+## Remove genes with outlier expression
+
+-   We decided to remove highly expressed genes \$ Rowsums\>7\*10\^6\$ and those in Sex cromosomes (x/y).
+
+```{r}
+# hemoglobin and sex chromosomes
+temp_objects$globins_vec <-
+  annotation_dat %>%
+  filter(grepl("hemoglobin subunit", DESCRIPTION) |
+           grepl("X|Y", SEQNAME)) %>%
+  select(GENEID) %>%
+  as_vector()
+
+# filter out high expression outliers and genes in Chroms XY
+filtered_dds <-
+  annotated_dds %>%
+  subset(subset = !grepl("X|Y", annotation_dat$SEQNAME)) %>%
+  subset(subset = rowSums(counts(.)) < 7000000)
+
+```
+
+# Quality control of data
+
+-   We use `vst()` transformation because it offers similar functionality to `rlog()` and is faster.
+
+-   We remove the sample **CFB2006** as an outlier in principal component analysis (PCA)
+
+```{r Exploratory PCA's}
+colData(filtered_dds)
+
+vst(filtered_dds, blind = T) %>% 
+  # batch extraction, CFB2006 seems like an outlier
+  plotPCA(., intgroup = "ntm_disease") +
+  geom_text(aes(label = "CFB2006",
+                x = -10, 
+                y = 25),
+            color = "red4",
+            nudge_x = 1, nudge_y = 1, check_overlap = T) +
+  theme(legend.position = "none")
+
+# ------------- Remove outlier CFB2006
+
+filtered_dds[ , filtered_dds$CFB_study_id!="CFB2006"] %>% 
+  vst() %>% 
+  plotPCA(., 
+          intgroup = "batch_extraction") +
+  labs(color = "Batch") +
+  geom_label(aes(label = name))
+
+filtered_dds <- filtered_dds[ , filtered_dds$CFB_study_id!="CFB2006"]
+```
+
+## Principal component plots
+
+We then explore the separation in principal component space according to several covariates
+
+```{r}
+# repeat exploratory PCAs after normalizing data
+temp_objects$vst_dds <- vst(filtered_dds, blind = T)
+
+PCAlist <- list()
+
+PCAlist$ntm_dis <-
+  plotPCA(temp_objects$vst_dds, 
+          intgroup = "ntm_disease") +
+  theme(legend.position = "bottom") +
+  labs(color = "NTM disease?")
+
+PCAlist$window <-
+  plotPCA(temp_objects$vst_dds, 
+          intgroup = "rna_growth_window") +
+  theme(legend.position = "bottom") +
+  labs(color = "Sampling window?") +
+  guides(color = guide_legend(nrow=2,
+                              byrow=TRUE))
+
+PCAlist$batch <-
+  plotPCA(temp_objects$vst_dds, 
+          intgroup = "batch_extraction") +
+  labs(color = "Extraction batch") +
+  theme(legend.position = "bottom")
+
+PCAlist$sex <-
+  plotPCA(temp_objects$vst_dds, 
+          intgroup = "female") +
+  labs(color = "Female sex?") +
+  theme(legend.position = "bottom")
+
+
+ggarrange(plotlist = PCAlist[1:3], nrow = 1)
+```
+
+## Batch correction ComBat-seq
+
+-   Apply `combat_seq()` to obtain adjusted counts for our dds and add to new DESeqDataset
+-   We can see small differences with the `analysis_dds`
+
+```{r new dds using ComBat}
+combat_dds <- 
+  ComBat_seq(counts = counts(filtered_dds),
+             batch = filtered_dds$batch_extraction,
+             # keep the variability according to ntm_disease
+             group = filtered_dds$ntm_disease) %>%
+  DESeqDataSetFromMatrix(# feed the count matrix to a new DESeq dataset
+    countData = .,
+    colData = colData(filtered_dds),
+    rowData = rowData(filtered_dds),
+    design = ~ ntm_disease)
+
+counts(filtered_dds)[1:5, 1:5]; counts(combat_dds)[1:5, 1:5]
+
+vst(combat_dds) %>%
+  plotPCA(., intgroup = "batch_extraction") +
+  labs(color = "Batch")
+
+```
+
+## Quality control after batch correction
+
+This is the initial distribution of data before removing the outlier.
+
+```{r initial PCA plot before outlier removal}
+vst(filtered_dds, blind = T) %>% 
+  # batch extraction, CFB2006 seems like an outlier
+  plotPCA(., intgroup = "ntm_disease") +
+  geom_text(aes(label = "CFB2006",
+                x = -10, 
+                y = 25),
+            color = "red4",
+            nudge_x = 1, nudge_y = 1, check_overlap = T) +
+  theme(legend.position = "none")
+```
+
+Now, we explore how are the results after applying the CombatSeq algorithm
+
+```{r PCA after Combat correction}
+temp_objects$vst_combat <- vst(combat_dds, blind = T)
+
+PCA_combat <- list()
+
+PCA_combat$ntm_dis <-
+  plotPCA(temp_objects$vst_combat, 
+          intgroup = "ntm_disease") +
+  theme(legend.position = "bottom") +
+  labs(color = "NTM disease?")
+
+PCA_combat$window <-
+  plotPCA(temp_objects$vst_combat, 
+          intgroup = "rna_growth_window") +
+  theme(legend.position = "bottom") +
+  labs(color = "Sampling window?") +
+  guides(color = guide_legend(nrow=2,byrow=TRUE))
+
+PCA_combat$batch <-
+  plotPCA(temp_objects$vst_combat, 
+          intgroup = "batch_extraction") +
+  labs(color = "Extraction batch") +
+  theme(legend.position = "bottom")
+
+PCA_combat$sex <-
+  plotPCA(temp_objects$vst_combat, 
+          intgroup = "female") +
+  labs(color = "Female sex?") +
+  theme(legend.position = "bottom")
+
+ggarrange(plotlist = PCA_combat[1:3], nrow = 1)
+```
+
+## QC by interval between sampling and NTM
+
+-   We also explore if time between whole blood collection and development of NTM-PD
+-   Separation in PCA seems to be significant according to PermANOVA statistical test
+
+```{r PCA for intervals of sampling}
+
+plotPCA(temp_objects$vst_combat, 
+        intgroup = "rna_disease_window") +
+  labs(color = "Window sample to pNTM disease") +
+  theme(legend.position = "bottom")
+
+temp_objects$pca_window_disease <- 
+  assay(temp_objects$vst_combat) %>% 
+  t() %>% 
+  data.frame() %>% 
+  cbind(., 
+        window_disease=temp_objects$vst_combat$rna_disease_window) %>% 
+  data.frame() %>% 
+  filter(!is.na(window_disease))
+
+temp_objects$pca_window_growth<- 
+  assay(temp_objects$vst_combat) %>% 
+  t() %>% 
+  data.frame() %>% 
+  cbind(., 
+        window_growth=temp_objects$vst_combat$rna_growth_window) %>% 
+  data.frame() %>% 
+  filter(!is.na(window_growth))
+
+# -------------- Apply PermANOVA to evaluate if the separation is significant. 
+
+# temp_objects$vst_combat$rna_disease_window
+
+library(vegan)
+adonis2(temp_objects$pca_window_disease[,-57652] ~ window_disease, 
+        data=temp_objects$pca_window_disease,
+        method = "eu")
+
+# -------------- evaluate PermAnova for rna to growth window
+adonis2(temp_objects$pca_window_growth[,-57652] ~ window_growth, 
+        data=temp_objects$pca_window_growth,
+        method = "eu")
+
+```
+
+## QC by time of sampling and NTM-PD
+
+PCA analysis of samples by three groups:\
+\
+1. Samples taken before the patient had first NTM positive culture\
+2. Samples from patients that progressed to NTM-PD\
+3. Samples from patients that did not progress to NTM-PD
+
+```{r}
+temp_objects$pca_window_growth <- 
+  assay(temp_objects$vst_combat) %>% 
+  t() %>% 
+  data.frame() %>% 
+  cbind(., 
+        window_growth=temp_objects$vst_combat$rna_growth_window) %>% 
+  data.frame() %>% 
+  filter(!is.na(window_growth))
+
+# -------------- evaluate PermAnova for rna to growth window
+adonis2(temp_objects$pca_window_growth[,-57652] ~ window_growth, 
+        data=temp_objects$pca_window_growth,
+        method = "eu")
+
+```
+
+# Differential gene expression
+
+We ran the model for *NTM disease y/n* using the batch corrected `combat_dds`
+
+```{r DGE using ComBat dds}
+colData(combat_dds)
+
+# assign appropriate design formula
+design(combat_dds) <- formula( ~ ntm_disease)
+combat_disease_dge <- DESeq(combat_dds)
+
+resultsNames(combat_disease_dge)
+
+# extract results optimized for FDR <0.3
+disease.combat_res <- 
+  results(combat_disease_dge,
+          # specify contrast to extract
+          name = "ntm_disease_Yes_vs_No",
+          alpha = 0.3) %>%
+  res_cleaner()
+
+# table 
+disease.combat_res %>%
+  slice(1:30) %>% 
+  select(-3,-4) %>% 
+  flextable_wrapper()
+```
+
+-   As a sensitivity analysis, we evaluate the differential gene expression adjusted to batches by including the batch variable in the DESeq call
+
+```{r Sensitivity analysis using batch as covariate in formula, eval=FALSE}
+# add batch to design formula
+design(filtered_dds) <- formula( ~ ntm_disease + batch_extraction)
+batch_disease_dge <- DESeq(filtered_dds)
+
+# extract results optimized for FDR <0.3
+disease.batch_res <- 
+  results(batch_disease_dge,
+          alpha = 0.3) %>% 
+  res_cleaner()
+
+# tables of results clean with annotation
+disease.batch_res %>%
+  slice(1:15) %>%
+  kable_wrapper(fontsize = 15)
+```
+
+Using the `ggvenn` library, we evaluate the common found genes in our results
+
+```{r, eval=FALSE}
+
+temp_objects$venn <-  list('DESEq ~ NTM disease + batch' = disease.batch_res$GENEID,
+                           ComBat = disease.combat_res$GENEID)
+
+ggvenn(temp_objects$venn, 
+       fill_color = c("#0073C2FF", "#EFC000FF", "#868686FF", "#CD534CFF"),
+       stroke_size = 0.5, set_name_size = 4)
+```
+
+# Gene set enrichment analysis 
+
+## Prepare data set for gene set enrichment
+
+
+```{r}
+
+# ----- create a temporary table with all results
+temp_objects$res_combat_dis <-   
+  results(combat_disease_dge,
+          name = "ntm_disease_Yes_vs_No",
+          # optimized for FDR<0.3
+          alpha = 0.3) %>%
+  data.frame() %>% 
+  rownames_to_column("GENEID") %>% 
+  # add annotation
+  inner_join(x = .,
+             y = annotation_dat,
+             by = "GENEID")
+
+# ----- create table with shrinked LFC and GENEID
+temp_objects$lfcshrink_combat <-  
+  lfcShrink(combat_disease_dge,
+            coef = "ntm_disease_Yes_vs_No",
+            type = "apeglm")  %>%
+  data.frame() %>%
+  rownames_to_column("GENEID") %>%
+  select(GENEID, log2FoldChange) %>% 
+  rename(shrinked_LFC = "log2FoldChange")
+
+# ----- save table for enrichment and export
+
+enrichment_data <- 
+  inner_join(temp_objects$lfcshrink_combat,
+             temp_objects$res_combat_dis,
+             # genes with
+             by = "GENEID") 
+
+# create named vector of decreasing LFC, no NAs
+temp_objects$genelist_LFC <- 
+  enrichment_data %>%
+  filter(!is.na(log2FoldChange)) %>%
+  arrange(desc(log2FoldChange))
+
+```
+
+## Load additional packages and run analysis
+
+```{r}
+temp_objects$packages <-  c("clusterProfiler", "org.Hs.eg.db", "enrichplot",
+                            "fgsea", "DOSE", "kableExtra", "msigdbr", "tidyverse")
+
+lapply(temp_objects$packages , library, character.only = TRUE)
+```
+
+Create a ranked list of genes by Log fold change to evaluate what genes are enriched. 
+
+```{r}
+# create ranked (stat) list of symbols
+temp_objects$genelist_stat <- 
+  enrichment_data %>%
+  select(SYMBOL, stat) %>%
+  filter(SYMBOL != "") %>%
+  na.omit() %>%
+  distinct() %>%
+  arrange(desc(stat)) %>% 
+  deframe()
+
+# create hallmark pathways reference
+temp_objects$msigdbr_list <- 
+  msigdbr(species = "Homo sapiens", 
+          category = "H") %>%
+  distinct(gs_name, gene_symbol) %>% 
+  as.data.frame() %>% 
+  split(x = .$gene_symbol, 
+        f = .$gs_name)
+
+# run fgsea with standard conditions
+temp_objects$fgsea_hallmark <- 
+  fgsea(pathways = temp_objects$msigdbr_list,
+        stats = temp_objects$genelist_stat) %>%
+  filter(padj<0.01) %>% 
+  # order by descendent NES
+  arrange(padj) 
+
+# table
+temp_objects$fgsea_hallmark %>% 
+  select(-c(leadingEdge, log2err, ES)) %>% 
+  kbl(format = "html", align = "c", digits = 7) %>% 
+  kable_styling(bootstrap_options = "striped",  
+                full_width = F,
+                font_size = 22) %>% 
+  row_spec(row = 0, 
+           bold = T) %>% 
+  kable_classic()
+
+# plot individual enrichment IFN alpha
+plotEnrichment(temp_objects$msigdbr_list[["HALLMARK_INTERFERON_ALPHA_RESPONSE"]],
+               temp_objects$genelist_stat) + 
+  labs(title="Interferon alpha response")
+
+# plot individual enrichment IFN gamma
+plotEnrichment(temp_objects$msigdbr_list[["HALLMARK_INTERFERON_GAMMA_RESPONSE"]],
+               temp_objects$genelist_stat) + 
+  labs(title="Interferon gamma response")
+
+
+# plot all enrichment
+ggplot() + theme_void()
+plotGseaTable(pathways=temp_objects$msigdbr_list [temp_objects$fgsea_hallmark$pathway[1:5]],
+              fgseaRes = temp_objects$fgsea_hallmark,
+              stats = temp_objects$genelist_stat)
+```
+
+# Exploration of results
+
+## MA plots ComBat DGE
+
+```{r MA plot ComBat}
+
+# create dataframe for plotting
+temp_objects$maplot_combat <- 
+  results(combat_disease_dge,
+          alpha = 0.3) %>% 
+  lfcShrink(dds = combat_disease_dge,
+            res = .,
+            coef = "ntm_disease_Yes_vs_No",
+            type = "apeglm",
+            saveCols = "SYMBOL") %>%
+  data.frame()
+
+temp_objects$maplot_combat %>% 
+  arrange(padj) %>% 
+  # select top n differentially expressed 
+  mutate(diff = ifelse(padj < 0.3, "yes", "no"),
+         top_genes = case_when(padj < 0.3 & row_number() <= 15 ~ as.character(SYMBOL),
+                               TRUE ~ NA_character_)) %>%
+  ggplot(aes(x = log2(baseMean),
+             y = log2FoldChange,
+             label = top_genes,
+             color = factor(diff))) +
+  geom_point(cex = 1.5) +
+  scale_color_manual(values = c("grey70", "blue2")) +
+  geom_label_repel(box.padding = 0.5, max.overlaps = Inf, color="blue") +
+  theme_classic() +
+  theme(legend.position = "none",
+        plot.title = element_text(size = 16, hjust = 0.5),
+        axis.text = element_text(size = 12),
+        plot.subtitle = element_text(color = "red4", face = "italic")
+  ) +
+  labs(title = "MA-plot batch corrected counts",
+       x = "Normalized mean counts",
+       y = "Shrunk Log2FoldChange")
+```
+
+### Mean expression of differentially expressed genes
+
+To plot the expression of some of the DEG, we create a for loop that + Returns a data frame for each gene with normalized counts and condition + Creates a scatter plot with specific formats for every gene
+
+```{r}
+# which(disease.combat_res$padj<.3)
+
+plot_expression <-  list()
+for (i in disease.combat_res$GENEID[1:15]) {
+  
+  # ----- extract data for each gene and define title/subtitle  
+  df <- plotCounts(combat_disease_dge,
+                   gene = i,
+                   intgroup = "ntm_disease",
+                   returnData = T)
+  title <- i
+  subtitle <- rowData(combat_disease_dge) %>%
+    data.frame() %>%
+    filter(GENEID == i) %>%
+    pull(SYMBOL)
+  
+  # ----- create ggplot scatter plot, label and color. No legend    
+  p <-ggplot(df, aes(y = count, 
+                     x = ntm_disease, 
+                     color = ntm_disease)) +
+    geom_jitter(width = 0.2, size = 3)
+  p <-
+    p +
+    scale_color_manual(values = c("green3", "red3")) +
+    labs(title = title,
+         subtitle = subtitle, 
+         x = "NTM disease",
+         y = "Normalized counts")
+  p <-
+    p +
+    theme_classic() +
+    theme(plot.title = element_text(hjust = 0.5),
+          legend.position = "none")
+  plot_expression[[i]]<- plot(p)
+}
+ggarrange(plotlist = plot_expression)
+
+```
+
+## Volcano plot of ComBat-seq \~ NTM disease (y/n)
+
+-   We transform the `DESeqRresults` into a data.frame
+-   Then, create an indicator variable for upregulated and downregulated genes
+-   Finally, create scatterplot in ggplot. Assign color if differentially expressed and add lines for pvalue/LFC cut-offs
+
+```{r}
+
+#----------------- create dataframe
+
+temp_objects$combat_volcano <-
+  results(combat_disease_dge,
+          name = "ntm_disease_Yes_vs_No",
+          alpha = 0.3,
+          tidy = T,
+          saveCols = "SYMBOL") %>%
+  # define downregulated and upregulated genes
+  mutate(diff_exp = case_when(pvalue < 0.001 & log2FoldChange <= -0.5 ~ "Downregulated",
+                              pvalue < 0.001 & log2FoldChange >= 0.5 ~ "Upregulated",
+                              TRUE ~ "NA"))
+
+# ----------------- volcano plot
+
+temp_objects$combat_volcano %>%
+  # plot log2foldchange(x) vs -Log10pvalue (y)
+  ggplot(data = .,
+         mapping = aes(
+           x = log2FoldChange,
+           y = -log10(pvalue),
+           col = diff_exp)) +
+  geom_point() +
+  theme_classic() +
+  # red=up, green=down, grey=NA
+  scale_color_manual(values = c("green", "grey50", "red")) +
+  labs(title = "Volcano plot of DEG by NTM-PD status",
+       subtitle = "Cutoffs: p < 0.001 & LFC > +/- 0.5", 
+       col = "NTM disease") +
+  geom_vline(xintercept = c(-0.5, 0.5), col = "red", linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.001), col = "red", linetype = "dashed") +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(face = "italic", color = "red4")) +
+  coord_cartesian(ylim = c(0, 7), xlim = c(-6, 6))
+```
+
+# Exploration of results of Cowman et al.
+
+## Presence of differentially expressed genes by NTM-PD status
+
+-   A list of 213 candidate genes was obtained from Cowman et al comparing NTM-PD vs non NTM-PD in COPD/Bronchiectasis, we will evaluate their gene expression in our cohort
+-   TRGC1 = TARP, repeated feature
+
+```{r}
+
+# vector with the top 25 differentially expressed genes for Cowman paper
+temp_objects$cowman_top <- c("FLJ45825", "GZMK", "TRGC1", "XCL2", "A2M", "CRTAM", "PMS2P1", "FCRL3", "PZP", "TIGIT",
+                             "PPIH", "AK5", "MUC12", "IFNG" )
+
+# vector with all differentially expressed genes
+temp_objects$cowman_deg <- c("PMS2P1", "SMA4", "CRTAM", "CASK", "TIGIT", "XCL2", "FCRL3", "SNORA38B", "GUSBP2", "PIGU",
+                             "FAHD2A", "CCND2", "TRAF5", "RNGTT", "ZNF831", "KRIT1", "SKAP1", "CCL28", "CDK5RAP2",
+                             "PPIH", "ATF7IP2", "GZMK", "ALMS1", "NFATC2", "VSIG1", "MAPKAPK5", "PPP5C", "HEATR1",
+                             "WEE1", "DCAF4", "ETS1", "ATXN7L1", "C1QTNF3", "SPIN1", "FLJ45825", "DGKE", "ZC3H6",
+                             "ANXA6", "RASGRF2", "RIOK1", "AGK", "IFNG", "TARP", "TARP", "RABEP1", "SLC38A1",
+                             "THEM4", "LINC00339", "EXOSC1", "INADL", "MIS12", "PDE4DIP", "CCSER2", "PPHLN1", "RPL12",
+                             "PCID2", "PARN", "TMEM19", "NT5DC3", "EPHA4", "SPTBN1", "PYROXD2", "SUPT3H",  "KLF12", "AK5",
+                             "TDRKH", "NCL", "BLOC1S5-TXNDC5", "OCM", "MRPS9", "ADHFE1", "NR2C1", "PIH1D1", "DOCK9",
+                             "CAMK4", "MINA", "NAT10", "ITPR3", "SLAMF6", "C15orf41", "NIT2", "ZDHHC6", "CHCHD3",
+                             "AKAP11", "NOLC1", "ARID1B", "IKZF3", "MDS2", "URGCP", "RNF125", "PRKCH", "NUP88","FBXO21",
+                             "CCDC88C", "CDC25B", "MUC12", "IARS", "FILIP1L", "TNRC6C", "UFSP2", "LANCL1", "BAZ1B",
+                             "SPTAN1", "SAMD3", "ARHGEF9", "CBLB", "MAPK9", "TNIK", "HSCB", "CLEC2D", "VWA9", "RTN4IP1",
+                             "KIAA0355", "PHACTR2", "GNB1L", "SNORA2B", "RPS23", "MPRIP", "ZZZ3", "KIAA2026", "TCF19",
+                             "LMAN1", "LDHB", "POMGNT1", "TTC4", "CCDC66", "MAP4K1", "CKAP2", "AKT3", "A2M", "CD247",
+                             "PDCL3", "KIF3B", "TOX", "ZBTB20", "DLG3", "NAT9", "NELL2", "PZP", "TMEM263", "CKAP5",
+                             "ZNF630", "KAT6B", "PRRC2B", "TUBB4A", "PMS1", "SCARNA7", "RASGRP1", "RALGAPA1",
+                             "RALGAPA1", "XCL1", "NPC1", "BTLA", "DARS", "IL2RB", "NBEAL1", "CEP85", "EXOSC9", "SPOCK2",
+                             "SACS", "SDAD1", "ATXN7L1", "C20orf194", "PSPH", "SNX24", "CHI3L2", "ITK", "MYCBP2",
+                             "GPR183", "RPUSD2", "METTL17", "CDC16", "AUTS2", "PHLDB2", "MOP-1", "POM121", "RNU6-83P",
+                             "FXN", "HELQ", "LOC100128816", "ICOS", "C2orf44", "GPATCH8", "RPS12", "ZBTB38", "ELP3",
+                             "ANKRD17", "APPL1", "DYNC1H1", "SLC25A26", "LINC01128", "FLJ11710", "HMOX2", "IKBKAP",
+                             "MIR4697HG", "TMEM209", "GAR1", "GMEB1", "MPRIP", "PHF20", "PBX4", "ZNF3", "NKTR",
+                             "FAIM3", "ACADSB", "WHAMM", "GPRIN3", "DDX24", "COIL", "ACYP1", "TRERF1", "BPTF", "BBS2")
+
+temp_objects$cowman_entrez <-  c (5379, 11039, 56253, 8573, 201633, 6846, 115352, 100124536, 387036, 128869,
+                                  51011, 894, 7188, 8732, 128611, 889, 8631, 56477, 55755, 10465, 80063, 3003,
+                                  7840, 4773, 340547, 8550, 5536, 55127, 7465, 26094, 2113, 222255, 114899, 10927,
+                                  100505530, 8526, 376940, 309, 5924, 83732, 55750, 3458, 445347, 445347, 9135,
+                                  81539, 117145, 29092, 51013, 10207, 79003, 9659, 54462, 51535, 6136, 55795,
+                                  5073, 55266, 51559, 2043, 6711, 84795, 8464, 11278, 26289, 11022, 4691, 100526836,
+                                  654231, 64965, 137872, 7181, 55011, 23348, 814, 84864, 55226, 3710, 114836, 84529,
+                                  56954, 64429, 54927, 11215, 9221, 57492, 22806, 259283, 55665, 54941, 5583, 4927,
+                                  23014, 440193, 994, 10071, 3376, 11259, 57690, 55325, 10314, 9031, 6709, 154075,
+                                  23229, 868, 5601, 23043, 150274, 29121, 81556, 84816, 9710, 9749, 54584, 677794,
+                                  6228, 23164, 26009, 158358, 6941, 3998, 3945, 55624, 7268, 285331, 11184, 26586,
+                                  10000, 2, 919, 79031, 9371, 9760, 26137, 1741, 26151, 4753, 5858, 90488, 9793,
+                                  57232, 23522, 84726, 10382, 5378, 677767, 10125, 253959, 253959, 6375, 4864, 151888,
+                                  1615, 3560, 65065, 64793, 5393, 9806, 26278, 55153, 222255, 25943, 5723, 28966, 1117,
+                                  3702, 23077, 1880, 27079, 64745, 8881, 26053, 90102, 643616, 9883, 100873782, 2395,
+                                  113510, 100128816, 29851, 80304, 23131, 6206, 253461, 55140, 26057, 26060, 1778,
+                                  115286, 643837, 79904, 3163, 8518, 283174, 84928, 54433, 10691, 23164, 51230, 80714,
+                                  7551, 4820, 9214, 36, 123720, 285513, 57062, 8161, 97, 55809, 2186, 583)
+
+# almost all of them are included in our detected genes 195/213 using entrez id to match
+intersect(rowData(combat_disease_dge)$ENTREZID,
+          temp_objects$cowman_entrez)
+
+# two are included in the differentially expressed genes
+intersect(disease.combat_res$ENTREZID,
+          temp_objects$cowman_entrez)
+
+# ------- Dataset of all differentially expressed genes in Cowman 
+
+temp_objects$cowman_all_results <-
+  results(combat_disease_dge,
+          alpha = 0.3,
+          tidy = T,
+          saveCols = c("SYMBOL", "ENTREZID")
+          ) %>%
+  subset(subset = ENTREZID %in% temp_objects$cowman_entrez)
+
+# ------- Dataset with top 15 differentially expressed genes in Cowman 
+
+temp_objects$cowman_top_results <-
+  results(combat_disease_dge,
+          alpha = 0.3,
+          tidy = T,
+          saveCols = c("SYMBOL", "ENTREZID")
+          ) %>%
+  subset(subset = SYMBOL %in% temp_objects$cowman_top)
+
+temp_objects$cowman_top_results %>% 
+  relocate(SYMBOL) %>%
+  remove_rownames() %>%
+  select(-c(row,ENTREZID)) %>%
+  arrange(padj) %>%
+  kable_wrapper()
+
+```
+
+## Evaluation of subset of DEG found in those with poor survival after NTM-PD diagnosis
+
+Another set of 215 genes conferred additional risk of death in patients with NTM-PD (n = 24)
+
+```{r}
+temp_objects$cowman_survival <- c("GRB10", "ARG1", "PFKFB2", "OLAH", "DAAM2", "CLEC4D", "FKBP5", "ERLIN1",
+                                  "IL18R1", "CD59", "FAM200B", "ANKRD22", "PSTPIP2", "ACSL4", "SMPDL3A", "AIM2",
+                                  "EXOC6", "JAK2", "VNN1", "CD177", "CLEC4E", "PRDM5", "OAT", "ZFYVE16", "TNFAIP6",
+                                  "RNF175", "UPP1", "ATP6V1C1", "HIATL1", "CNIH4", "IRAK3", "IL1R2", "NMI",
+                                  "ECHDC3", "HSDL2", "ASPH", "TRMT1L", "CCDC126", "CEP162", "DRAM1", "HTATIP2",
+                                  "NFIL3", "CSGALNACT2", "CA4", "HMGB2", "MAP2K6", "CARD17", "PTENP1", "TLR2",
+                                  "MRPL44", "GCA", "SUMO4", "CAPNS2", "KLHL8", "SAP30L", "GPR160", "TRIM22",
+                                  "LIN7A", "IFNGR1", "CLEC5A", "CLK4", "ELF2", "BRI3", "36950", "TLR1", "TXN",
+                                  "CEP97", "SRXN1", "B3GNT2", "HSPA1L", "HSPA1L", "HSPA1L", "RRAGD", "MSRB2",
+                                  "CARD16", "ZMPSTE24", "ELMOD2", "BCL2A1", "C20orf24", "SNORD116-1", "LONRF1",
+                                  "IL13RA1", "ST3GAL6", "SSFA2", "CASP1", "ARL6IP6", "ANXA3", "BMX", "ASAH1",
+                                  "AGFG1", "SULT1B1", "RHOT1", "NLRC4", "CASP4", "CPEB3", "CCPG1", "OSER1",
+                                  "C18orf32", "GALNT7", "GBE1", "HSD17B11", "FAM76B", "NDUFB3", "SNX10", "TTC26",
+                                  "TOPORS", "SNX16", "CIR1", "TCN1", "KIAA1107", "CHUK", "PHTF1", "RMI1", "SNORA28",
+                                  "TTC32", "GADD45A", "FBXL5", "PPP1R2P1", "PPP1R2P1", "PPP1R2P1", "CHIT1",
+                                  "SIPA1L2", "EXOC1", "RAB18", "ZNF267", "RTP4", "RNASEL", "ZNF493", "MSL3",
+                                  "ZNF93", "FLT3", "TIFA", "BIN3-IT1", "ZDHHC17", "METTL9", "SHOC2", "CENPW",
+                                  "SERPINB1", "KIAA1033", "C7orf60", "SLK", "GK3P", "GYG1", "CHURC1", "SFT2D1",
+                                  "AIG1", "LY96", "GBP6", "RAB19", "TLR4", "SOS2", "IFNGR1", "ACTR10", "KLHL2",
+                                  "CMTM2", "LIPM", "BAZ1A", "IFI16", "DDX60L", "SH3GLB1", "SNX13", "S100A6",
+                                  "CNEP1R1", "CYB5R4", "CLK4", "CFAP58", "ZNF799", "TWF1", "DDX43", "SLC22A4",
+                                  "RNF145", "LOC100129831", "CAMLG", "CCNB2", "APC", "NECAB1", "PPFIBP2", "MORC3",
+                                  "ABCA13", "BLOC1S1", "TBK1", "TGFBR1", "FAS", "HIST2H2BF", "PPP1R12A", "ERI1",
+                                  "TNFSF10", "BLOC1S2", "HIST2H4B", "HIST2H4A", "KIN", "SLCO4C1", "DYNLT1", "DDX60",
+                                  "TWF1", "EXOSC4", "CHMP2B", "BRCA1", "NBN", "RP2", "TRAPPC8", "ARHGAP18",
+                                  "ST6GALNAC3", "IDI1", "MFN1", "RALB", "ZNF354A", "XRN1", "PSMD6", "GNG11",
+                                  "SAT1", "DLGAP1-AS1", "CCNH", "RAB2A", "NUPL1")
+
+
+temp_objects$cowman_survival_entrez <- c(2915, 4905, 1722, 2806, 848, 5178, 11473, 7425, 4646, 12677, 3170, 8579,
+                                         3958, 3478, 4733, 7403, 5539, 3234, 4070, 2891, 6317, 6641, 4196, 2472,
+                                         4195, 2082, 8470, 11060, 6166, 10408, 1461, 8515, 8073, 2086, 11940, 12642,
+                                         8496, 6807, 12940, 8064, 7337, 1641, 8895, 305, 2810, 8264, 3545, 10548,
+                                         11739, 4396, 4644, 7818, 5205, 2317, 2344, 10459, 9110, 3725, 8160, 11129,
+                                         4744, 8989, 10941, 11391, 946, 4667, 6768, 13004, 11818, 2886, 8434, 12243,
+                                         1080, 3838, 4780, 13186, 2162, 952, 6203, 12926, 12816, 5464, 5548, 9843,
+                                         3701, 6568, 10894, 3976, 12220, 7580, 814, 6725, 11160, 10655, 6996, 9608,
+                                         7704, 5196, 3810, 1514, 7256, 669, 5414, 5035, 2809, 10593, 8855, 6430,
+                                         2174, 12737, 9027, 4304, 12716, 3573, 8314, 5873, 10134, 4267, 8063, 12589,
+                                         6215, 9346, 6060, 490, 11269, 8155, 9501, 9869, 9201, 5895, 7784, 4006, 11191,
+                                         11404, 5075, 586, 3070, 1240, 2936, 4894, 530, 6921, 6425, 7555, 9028, 2683,
+                                         12059, 2071, 12620, 2586, 10914, 4311, 5008, 9718, 11276, 210, 4409, 8695,
+                                         7546, 1260, 5738, 11264, 3795, 12618, 218, 7761, 4399, 8562, 3487, 1207, 2796,
+                                         7156, 9207, 5234, 9473, 12676, 8698, 11553, 4120, 8887, 6632, 8144, 8548,
+                                         1371, 8464, 4809, 1709, 8943, 26, 83, 7041, 10403, 2631, 292, 1713, 11421,
+                                         3585, 12669, 9437, 1390, 8575, 10910, 71, 9640, 7521, 391, 7863, 10081,
+                                         8933, 4464, 4318, 7920, 2286, 427, 11854)
+
+
+intersect(rowData(combat_disease_dge)$ENTREZID,
+          temp_objects$cowman_survival_entrez)
+
+# none are included in the differentially expressed genes
+intersect(disease.combat_res$ENTREZID,
+          temp_objects$cowman_survival_entrez)
+```
+
+# Sensitivity analyses
+
+## Sensitivity analysis of poor survival signature
+
+How many of those genes (215 gene signature) have (unadjusted p-value) p \< 0.5 in our results
+
+```{r}
+
+temp_objects$cowman_survival_results <- 
+  results(combat_disease_dge,
+          alpha = 0.3,
+          tidy = T,
+          saveCols = c("SYMBOL", "ENTREZID")
+  ) %>%
+  subset(subset = ENTREZID %in% temp_objects$cowman_survival_entrez) 
+
+temp_objects$cowman_survival_results %>% 
+  relocate(SYMBOL) %>%
+  remove_rownames() %>%
+  select(-c(row,ENTREZID)) %>%
+  arrange(pvalue) %>%
+  kable_wrapper()
+
+```
+
+## Trend of mean expression of Cowman candidate genes
+
+Check the trend of these candidate genes using scatter boxplots in the NTM pulmonary disease outcome groups
+
+```{r}
+plot_candidates <- list()
+
+# check trends according to NTM disease
+for (i in temp_objects$cowman_top_results$row) {
+  # ----- extract data for each gene and define title/subtitle  
+  df <- plotCounts(combat_disease_dge,
+                   gene = i,
+                   intgroup = "ntm_disease",
+                   returnData = T)
+  title <- rowData(combat_disease_dge) %>%
+    data.frame() %>%
+    filter(GENEID == i) %>%
+    pull(SYMBOL)
+  
+  # ----- create ggplot scatter plot, label and color. No legend    
+  p <-ggplot(df, aes(y = count, 
+                     x = ntm_disease, 
+                     color = ntm_disease)) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_jitter(width = 0.2, size = 1) +
+    stat_compare_means(label.x.npc = "center",
+                       label = "p.format",
+                       vjust = 1)
+  p <-
+    p +
+    scale_color_manual(values = c("blue3", "red3")) +
+    labs(title = title)
+  p <-
+    p +
+    theme_classic() +
+    theme(plot.title = element_text(hjust = 0.5, size = 10),
+          axis.title = element_blank(),
+          axis.text.x = element_blank())
+  plot_candidates [[title]] <- p
+  rm(p)
+}
+
+# empty plot with only legend
+plot_candidates[[14]] <- 
+  get_legend(plot_candidates[[10]] +
+               labs(color = "NTM-PD") +
+               theme(legend.key.size = unit(1, "cm"),
+                     legend.title = element_text(face = "bold.italic"),
+                     legend.text = element_text(size =  12)) +
+               guides(colour = guide_legend(override.aes = list(size=1.2)))
+  ) %>% 
+  as_ggplot()
+
+
+# create single plot with 13 out of the top 15 features in Cowman et al. 
+ggarrange(plotlist = plot_candidates[c(1:14)], 
+          ncol = 4, nrow = 4, legend = "none") %>% 
+  annotate_figure(left = text_grob("Normalized counts", rot = 90))
+
+```
+
+## Sensitivity analysis removing samples taken after NTM-PD diagnosis
+
+```{r Sensitivity: removing samples after NTM-PD diagnosis, eval=FALSE}
+# remove samples taken after NTM-PD diagnosis 
+temp_objects$sensitivity_dds <- 
+  subset(filtered_dds,
+         select =  !colData(filtered_dds)$CFB_study_id %in% ntmpd_before_sampling)
+
+# one extraction batch has only 1 sample (batch==5), we assign 4 to allow batch correction
+colData(temp_objects$sensitivity_dds)$batch_extraction[colData(temp_objects$sensitivity_dds)$batch_extraction == 5] <- 4
+colData(temp_objects$sensitivity_dds)$batch_extraction <- 
+  droplevels(colData(sensitivity_dds)$batch_extraction)
+
+# perform batch correction using ComBat
+temp_objects$sensitivity_ComBat <- 
+  ComBat_seq(counts = counts(temp_objects$sensitivity_dds),
+             batch = temp_objects$sensitivity_dds$batch_extraction,
+             # keep the variability according to ntm_disease
+             group = temp_objects$sensitivity_dds$ntm_disease) %>%
+  DESeqDataSetFromMatrix(# feed the count matrix to a new DESeq dataset
+    countData = .,
+    colData = colData(temp_objects$sensitivity_dds),
+    rowData = rowData(temp_objects$sensitivity_dds),
+    design = ~ ntm_disease)
+
+# exploratory PCA 
+vst(temp_objects$sensitivity_ComBat, blind = T) %>% 
+  plotPCA(., intgroup = "ntm_disease") 
+
+# differential gene expression DESeq2
+temp_objects$sensitivity_dge <- DESeq(temp_objects$sensitivity_ComBat)
+
+# extract results optimized for FDR <0.3
+results(temp_objects$sensitivity_dge,
+        # specify contrast to extract
+        name = "ntm_disease_Yes_vs_No",
+        alpha = 0.3)
+
+```
+
+# Session info
+
+```{r}
+sessionInfo()
+```

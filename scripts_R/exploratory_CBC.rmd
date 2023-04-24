@@ -1,0 +1,426 @@
+---
+title: "CBC_exploration_cohort_RNAseq"
+author: "MDP"
+output: 
+  html_document:
+    toc: true
+    theme: united
+    toc_depth: 2
+    number_sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message =F, eval = F)
+```
+
+# Introduction
+
+## Aims
+
+-   To explore the blood cell count (CBC) of the patients in the RNAseq cohort to evaluate if there are any significant differences among outcome groups
+-   In addition, we will create an output dataset cleaned for use (if needed) as covariate in analysis
+-   To explore the impact of CBC results in the outcome using a principal component analysis (PCA)
+-   To compare the ground truth CBC data with the results of cibersort deconvolution
+
+# Preparation
+
+## Required packages
+
+```{r}
+library(tidyverse) # data manipulation
+library(knitr) # produce publication ready tables
+library(skimr) # data exploration
+library(ggpubr)# publication ready improvements to ggpplot
+library(rlang)
+
+# set options for table output to 2 digits
+options(digits = 2)
+```
+
+## Import CBC data
+
+```{r}
+cbc_data <- read_csv(file = "ntm_cbc_dryad.csv")
+```
+
+## Deconvolution results
+
+**Cibersort** used TPM normalized gene counts and the LM22 signature matrix to deconvolute our RNAseq data and impute cell population fractions in whole blood.
+
+We summarize cell composition by grouping immune cells of the same lineage together (Macrophage + Monocyte -\> monocyte). When reading data, `name_repair ="universal"` removes all white space in column names.
+
+```{r}
+# create a list to store temporary objects
+temp_objects <-  list()
+
+
+# percentage cleaning
+temp_objects$perc_temp <-
+  read_csv(file = "./cibersort_impute_percentage.csv", 
+           name_repair = "universal") %>%
+  select(-c("P.value", "RMSE", "Correlation"))
+
+# define function to calculate sum of columns where colnames matches a string
+rowSum_if_contains <-  
+  function (x=.data, string="grep") {
+    x2 <- select(x, matches(string))
+    x3 <- rowSums(x2)
+    return(x3)
+    }
+
+# colnames(perc_temp)
+temp_objects$perc_temp<- 
+  temp_objects$perc_temp %>% 
+  mutate(B_lymph_perc=rowSum_if_contains(., "B.cells|Plasma"),
+         T_lymph_perc=rowSum_if_contains(., "T.cells"),
+         Monocyte_perc=rowSum_if_contains(., "Mono"),
+         NK_perc=rowSum_if_contains(.,"NK"),
+         Mastocytes_perc=rowSum_if_contains(.,"Mast.cell"),
+         eosin_perc=Eosinophils,
+         neut_perc=Neutrophils,
+         lymph_perc=B_lymph_perc + T_lymph_perc) %>% 
+  select(Mixture, contains("perc"))
+
+```
+
+We do the same for the absolute counts data frame
+
+```{r}
+#percentage cleaning
+temp_objects$abs_temp<- 
+  read_csv(file="./cibersort_impute_absolute.csv",
+           name_repair ="universal") %>% 
+  select(-c("P.value","RMSE","Correlation", "Absolute.score..sig.score."))
+
+# colnames(abs_temp)
+temp_objects$abs_temp <- 
+  temp_objects$abs_temp %>%
+  mutate(B_lymph_abs=rowSum_if_contains(., "B.cells|Plasma"),
+         T_lymph_abs=rowSum_if_contains(., "T.cells"),
+         Monocyte_abs=rowSum_if_contains(., "Mono"),
+         NK_abs=rowSum_if_contains(.,"NK"),
+         Mastocytes_abs=rowSum_if_contains(.,"Mast.cell"),
+         eosin_abs=Eosinophils,
+         neutr_abs=Neutrophils,
+         lymph_abs=B_lymph_abs+T_lymph_abs) %>% 
+  select(Mixture, contains("abs"))
+
+```
+
+## Merge CBC and cibersort into a wide format dataframe
+
+We merge both **cibersort** datasets together, adding a prefix to de-convoluted estimates. And finally, we merge the `CBC_data` and the `cibersort_data` according to `CFB_study_id`
+
+```{r}
+cibersort_data <- 
+  left_join(temp_objects$abs_temp, 
+            temp_objects$perc_temp, 
+            by="Mixture") %>% 
+  rename("CFB_study_id" = "Mixture")
+
+# add prefix
+colnames(cibersort_data)[-1]<- paste0("cs_", colnames(cibersort_data)[-1]) 
+
+merged_data <- 
+  inner_join(cbc_data, cibersort_data, by="CFB_study_id")
+```
+
+# CBC Data exploration
+
+## Missing information
+
+**Discordant** means that subject does not have a CBC result available in a 3-day window from the sample used in RNAseq. In exploratory analysis, we see that there are no outlier values in CBC counts and that the percentage of missing data per variable is low.
+
+```{r}
+cbc_data %>% filter(discordant==1)
+
+cbc_data %>% 
+  count(discordant) %>%
+  mutate(freq=n/42*100) %>% 
+  kable(col.names=c("", "n=42", "%"), 
+        caption="Does subject have CBC results in a 3-day window?")
+
+# Grouped by NTM-PD group (y/n)
+cbc_data %>% 
+  count(discordant, ntm_disease) %>%
+  mutate(freq=n/42*100) %>% 
+  kable(caption="Subjects outside of window for CBC per NTM outcome")
+
+# explore if there are outliers in CBC data
+cbc_data %>%
+  select(matches("abs|perc")) %>% 
+  skim() 
+```
+
+## CBC differences among NTM-PD groups
+
+We create a list called `CBC_plots` to populate with results of ggplots.
+
+WBC counts do not show visual or statistical differences between outcomes
+
+```{r}
+CBCplots <- list()
+
+graph_boxplot_format <-  function (data = data,
+                                   y_var,
+                                   lim_y = c(0, 16),
+                                   title = "title",
+                                   vjust_stat = 0,
+                                   ylab = "10^3 cells/uL") {
+  dat <- filter(data, discordant == 0)
+  plot <-  ggplot(data = dat,
+                  mapping = aes(x = ntm_disease,
+                                y = {{y_var}},
+                                fill = ntm_disease)) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_jitter(width = 0.1, size = 2) +
+    stat_compare_means(vjust = vjust_stat,
+                       paired = F,
+                       method = "wilcox.test") +
+    labs(x = "",
+         y = ylab,
+         fill = "NTM-PD",
+         title = title) +
+    coord_cartesian(ylim = lim_y) +
+    theme_pubr() +
+    theme(legend.position = "none",
+          plot.title = element_text(hjust = 0.5, size = 16),
+          axis.title.y = element_text(size = 14),
+          axis.text.x = element_blank()
+          ) +
+    scale_fill_manual(values = c("red2", "blue"))
+
+# print plot
+ plot
+  }
+
+```
+
+-   WBC does not have significant differences
+-   Neutrophil counts do not have a significant difference among the three groups
+-   Monocytes and lymphocyte do not show significant differences either.
+
+```{r}
+CBCplots$wbc <- graph_boxplot_format(cbc_data,
+                                    y_var = WBC_abs,
+                                    title = "Leukocytes",
+                                    lim_y = c(0, 15)) ; CBCplots$wbc
+
+CBCplots$neut <- graph_boxplot_format(cbc_data,
+                                     y_var = Neut_abs,
+                                     title = "Neutrophils",
+                                     lim_y = c(0, 12))
+
+CBCplots$lym <- graph_boxplot_format(cbc_data,
+                                     y_var = Lymph_abs,
+                                     title = "Lymphocytes",
+                                     lim_y = c(0, 3.5)); CBCplots$lym
+
+CBCplots$mono <- graph_boxplot_format(cbc_data,
+                                      y_var = Mono_abs,
+                                      title = "Monocytes",
+                                      lim_y = c(0,1), 
+                                      vjust_stat = -1) ; CBCplots$mono
+```
+
+-   Same exploration using percentages of blood cells
+
+```{r}
+
+CBCplots$Neut_perc <- graph_boxplot_format(cbc_data,
+                                     y_var = Neut_perc,
+                                     title = "Neutrophils",
+                                     ylab = "Percentage",
+                                     lim_y = c(0, 100)); CBCplots$Neut_perc
+
+CBCplots$Lymph_perc <- graph_boxplot_format(cbc_data,
+                                     y_var = Lymph_perc,
+                                     title = "Lymphocytes",
+                                     ylab = "Percentage",
+                                     lim_y = c(0, 40)); CBCplots$Lymph_perc
+
+CBCplots$Mono_perc <- graph_boxplot_format(cbc_data,
+                                      y_var = Mono_perc,
+                                      title = "Monocytes",
+                                     ylab = "Percentage",
+                                      lim_y = c(0,15), 
+                                      vjust_stat = -1) ; CBCplots$Mono_perc
+
+CBCplots$neut_lym_ratio <- graph_boxplot_format(cbc_data,
+                                      y_var = Neut_abs/Lymph_abs,
+                                      title = "Monocytes",
+                                      ylab = "Neut to Lym ratio",
+                                      lim_y = c(0,10), 
+                                      vjust_stat = 15) ; CBCplots$neut_lym_ratio
+```
+
+Now, I use `ggarrange` to plot everything in the same page
+
+-   No statistically significant differences by cell percentages or absolute numbers.
+-   Good correlation between cybersort and ground thruth results
+
+```{r, include=FALSE, eval=FALSE}
+ggarrange(CBCplots$wbc, CBCplots$neut,
+          CBCplots$lym, CBCplots$mono,
+          labels = c("A","B","C","D"), common.legend = T, legend = "bottom"
+          )
+
+
+ggarrange(CBCplots$neut, CBCplots$lym, CBCplots$mono,
+          labels = c("A","B","C"),
+          nrow = 1)
+```
+
+# Principal component analysis (PCA)
+
+```{r}
+library(factoextra)
+```
+
+-   First, we clean a dataset to include only relevant CBC data for PCA:
+    -   Remove patients with discordant CBC results
+    -   Move variables with absolute counts/percentage to the first columns
+    -   Select IDs and NTM outcome, remove everything else (HCT, RDW)
+
+```{r}
+pca_data <- 
+  cbc_data %>% 
+  filter(discordant==0) %>% 
+  relocate(matches("abs|perc")) %>%  
+  select(matches("abs|perc"), CFB_study_id, ntm_disease, -RDW_perc, -HCT_perc)
+
+# produce data set for PCA
+pca_1 <- prcomp(x = pca_data[, 1:13],
+                # standardize to unit variance
+                scale = T)
+```
+
+## Exploring variable loadings
+
+-   `fviz_eig()` produces a scree plot to select \# of relevant components
+-   `get_eigenvalue()` obtains eigenvalues and explained variability per component
+
+```{r}
+fviz_eig(pca_1)
+# 3 PC explain > 70% of variability
+```
+
+-   `fviz_pca_var()` plots the contribution of variables to each PC. We specify a gradient of colors according to contribution.
+
+```{r}
+fviz_pca_var(pca_1,
+             axes = c(1, 2), # dimensions 1 and 2
+             # repel labels
+             repel = T,
+             # use quality of representation for coloring
+             col.var = "contrib",
+             gradient.cols = c("yellow", "orange", "red"))
+
+```
+
+-   Neutrophils (abs/perc) and WBC (abs) represent the most important weights in the first 2 components. They are followed by Monocyte (abs) and Lymphocytes (perc)
+
+```{r}
+fviz_contrib(pca_1,
+             choice = "var",
+             axes = 1:2,
+             top = 5)
+```
+
+## Exploring separation of individuals
+
+```{r}
+pca_plot<- fviz_pca_ind(pca_1,
+                        # shows only points and no text
+                        geom.ind = "point",
+                        col.ind = pca_data$ntm_disease,
+                        legend.title = "NTM disease",
+                        mean.point = FALSE,
+                        addEllipses = TRUE,
+                        # removes central lines
+                        axes.linetype = NA)
+
+ggpubr::ggpar(pca_plot,
+              xlab = "PC1 (34.2%)",
+              ylab = "PC2 (23.3%)",
+              title = "Principal component analysis of CBC data (n = 39)",
+              ggtheme = theme_classic2())
+```
+
+# Comparison between ground truth and cibersort results
+
+We exclude three subjects as they do not have CBC counts. To measure the concordance we calculate pearson correlation between both data sets.
+
+-   To avoid repeating code, I create a function to produce desired plots
+
+```{r}
+comparison_plots_list <- list()
+
+plot_comparison <- function(data=data, x_var, y_var, title="title"){
+  # data=input dataframe
+  # x_var= variable in cybersort data
+  # y_var= variable in  ground thruth data
+  # title is a string for the title
+  
+  # -----------------------
+  
+  filtered<- dplyr::filter(data, discordant==0)
+  plot <- ggplot(data = filtered, 
+                 mapping = aes(x = {{x_var}}, 
+                               y = {{y_var}})) +
+    geom_point(colour = "grey37") +
+    stat_cor(aes(label = paste("Pearson", ..r.label.., ".", ..p.label.., sep = '~'))) +
+    geom_smooth(method = "lm", se = F, col = "red") +
+    labs(title = title,
+         x = "Cibersort results",
+         y = "Ground thruths (CBC)") +
+    theme_classic2() +
+    theme(plot.title = element_text(hjust = 0.5, size = 16))
+  plot
+}
+
+```
+
+Now, I make plots for every comparison of lymphocytes, monocytes and neutrophils. Remaining groups are not properly de-convoluted by cibersort using LM22 matrix.
+
+```{r}
+
+comparison_plots_list$lym_perc <- plot_comparison(data = merged_data, 
+                                                  cs_lymph_perc, 
+                                                  Lymph_perc, 
+                                                  title = "Percentage of lymphocytes")
+
+comparison_plots_list$neu_perc <- plot_comparison(data = merged_data, 
+                                                  cs_neut_perc, 
+                                                  Neut_perc, 
+                                                  title = "Percentage of neutrophils")
+
+comparison_plots_list$mon_perc <-  plot_comparison(data = merged_data,
+                                                   cs_Monocyte_perc,
+                                                   Mono_perc,
+                                                   title = "Percentage of monocytes")
+
+comparison_plots_list$eos_perc <- plot_comparison(data = merged_data, 
+                                                  cs_eosin_perc, 
+                                                  Eos_perc, 
+                                                  title = "Percentage of eosinophil")
+```
+
+Now, we use `ggpubr` package to summarize multiple plots into a single one ready to publish/present.
+
+```{r}
+ggarrange(plotlist = comparison_plots_list[c("lym_perc","neu_perc","mon_perc")], 
+          # selects only percentage plots
+          ncol=3,
+          nrow=1,
+          labels = c("A","B","C"))
+```
+
+## Session info
+
+```{r}
+sessionInfo()
+```
+

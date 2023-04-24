@@ -1,0 +1,693 @@
+---
+title: "Exploratory.clinial.and.cultures.rmd"
+author: "MDP"
+output: 
+  html_document:
+    toc: true
+    theme: readable
+editor_options: 
+  chunk_output_type: inline
+  markdown: 
+    wrap: 80
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval=T, echo = F)
+```
+
+# Introduction
+
+-   This script summarizes the demographic and clinical analysis in the RNAseq
+    cohort.
+-   Some variables are also exported as relevant metadata for differential gene
+    expression analysis.
+-   Data sets are curated to minimize the possibility of identifying
+    participants in the study and only relevant data to reproduce the results of
+    the publication is provided.
+
+## Preparation - Loading necessary packages
+
+```{r, message=F, warning=FALSE}
+# use R included pipe to load all libraries at once
+ c("tidyverse", "lubridate", "ggpubr", "kableExtra") |>
+  lapply(library, character.only=T)
+```
+
+## Preparation - Define wrapper functions
+
+```{r wrapper functions}
+
+# ------------------------ count table wrapper
+
+count_table <-  function(data, var, group = NULL, keep_na = TRUE,
+                         round.digits=2) {
+  ### Produces count table with proportions
+  ### It does not group by any variable, but it can be specified
+  ### Can decide if you want to drop or keep NA levels
+  
+  # sanity checks 
+  if (!is.data.frame(data))   stop("Data must be tibble/data.frame!")
+  if (!is.factor(data %>% pull({{var}})))   stop("Var to count must be a factor!")
+
+  # remove or keep NA levels
+  if (keep_na == TRUE) {
+    df <- data
+    df %>%
+      group_by({{group}}) %>% 
+      dplyr::count({{var}})%>% 
+      mutate(prop = prop.table(n) * 100,
+             prop = round(prop, round.digits))
+  } else {
+    df <- data
+    df %>%
+      filter(!is.na({{var}})) %>% 
+      group_by({{group}}) %>% 
+      dplyr::count({{var}})%>% 
+      mutate(prop = prop.table(n) * 100,
+             prop = round(prop, round.digits))
+    }
+  }
+
+# ------------------- wrapper to summarize central tendency and dispersion measures
+quant_summary <- function(data, group=NULL, variable) {
+  
+  # sanity checks 
+  if (!is.data.frame(data))   stop("Data must be tibble/data.frame!")
+  if (!"tidyverse" %in% rownames(installed.packages()))   stop("Requires tidyverse")
+  
+  # combination of deparse(substitute()) gives me a string
+  # print name of variable evaluated just in case
+  paste("Evaluated variable:", deparse(substitute(variable))) %>%  print()
+  
+  # code
+  df <- data
+  df %>% group_by({{group}}) %>% 
+    summarise(count =n(),
+              mean = mean({{variable}}, na.rm=T),
+              sd = sd({{variable}}, na.rm=T),
+              min = min({{variable}}, na.rm=T),
+              p25 = quantile({{variable}}, na.rm=T, probs=0.25),
+              median = median({{variable}}, na.rm=T),
+              p75 = quantile({{variable}}, na.rm=T, probs=0.75),
+              max = max({{variable}}, na.rm=T))
+}
+```
+
+## Preparation - Data wrangling/cleaning
+
+-   Dataset includes 42 patients and 51 variables
+-   Empty fields are populated with *NA*
+
+```{r}
+base_data<- read_csv(file = "./ntm_analysis_dryad.csv")
+
+# convert character var to factors
+ntm_data <- 
+  base_data %>% 
+  mutate(across(where(is.character), 
+                as_factor))
+
+# verify structure of data set
+glimpse(ntm_data)
+```
+
+# Analysis of sampling intervals
+
+## Interval from first nontuberculous mycobacteria (NTM) growth to RNA sample acquisition
+
+```{r}
+
+#----------------------- descriptive statistics
+ntm_data %>%
+  quant_summary(., variable = rna_growth_interval)
+
+shapiro.test(ntm_data$rna_growth_interval)
+
+#----------------------- boxplot of growth to blood sample interval
+ntm_data %>%
+  filter(!is.na(rna_growth_interval)) %>%
+  ggplot(aes(y = rna_growth_interval, 
+             # centers in x=0 to allow jitter
+             x = 0)) +  
+  # define the width of error bars
+  stat_boxplot(geom = 'errorbar',  width = 0.3) + 
+  geom_boxplot(varwidth = T, outlier.shape = NA) +
+  geom_jitter(width = 0.2) + 
+  labs(title = "Months between sample and first growth",
+       y = "months",
+       x = "") +
+  theme_classic () +
+  theme(axis.text.x = element_blank()) +
+  xlim(-1, 1) # controls width of boxplot
+
+#----------------------- amount of samples before NTM growth
+ntm_data %>% 
+  filter(rna_growth_interval < 0) %>% 
+  select(CFB_study_id, rna_growth_interval, ntm_disease) 
+
+```
+
+## Interval of total follow-up time in study
+
+Calculated as the time in months between the first NTM growth and the occurrence
+of pulmonary NTM disease (NTM-PD), death or lung transplant
+
+```{r}
+
+# not normal distribution, summary of total
+shapiro.test(ntm_data$follow_interval)
+quantile(ntm_data$follow_interval)
+
+# summary by groups 
+ntm_data %>%
+  quant_summary(., variable = follow_interval, group = ntm_disease)
+
+# lenght of follow up until development of NTM-PD
+ntm_data %>%
+  filter(ntm_disease=="Yes") %>%
+  quant_summary(., variable = follow_interval, group = ntm_disease)
+```
+
+## Interval from sample acquisition to NTM-PD
+
+```{r}
+# ------------------ boxplot
+ggplot(ntm_data,
+       aes(y = rna_disease_interval,
+           x = "")) +
+  geom_boxplot(outlier.shape = NULL) +
+  geom_jitter()
+
+# ------------------ table 
+ntm_data %>% 
+  filter(ntm_disease=="Yes") %>% 
+  select(CFB_study_id, rna_disease_interval, ntm_disease)
+
+# ------------------ sampled before NTM-PD 
+ntm_data %>% 
+  filter(ntm_disease=="Yes" & rna_disease_interval<0) %>% 
+  quant_summary(., variable = rna_disease_interval)
+
+# ------------------ sampled after NTM-PD
+ntm_data %>% 
+  filter(ntm_disease=="Yes" & rna_disease_interval>0) %>% 
+  quant_summary(., variable = rna_disease_interval)
+```
+
+# Analysis of demographic data
+
+No significant differences where found at baseline for:
+
+-   Age categories
+-   Proportion of females
+-   CFTR genotype classification
+-   Baseline co-morbidities (diabetes and pancreatic insufficiency)
+
+```{r demographic data}
+
+# ------------- Age at NTM growth
+
+# are there NAs in the age data
+ntm_data$age_cat %>% 
+  is.na() %>% 
+  any()
+
+# histogram of age
+ggplot(ntm_data,
+       aes(x=age_cat)) +
+  geom_bar(fill="black", 
+           col="grey") +
+  labs(title="Categories of baseline age") +
+  theme_classic()
+
+# table
+count_table(ntm_data, age_cat)
+
+# ------------- Female sex
+count_table (ntm_data, female)
+
+# female sex ~ group
+count_table (ntm_data, female, group = ntm_disease)
+fisher.test(ntm_data$female, ntm_data$ntm_disease)
+
+# ------------- Genotype
+count_table (ntm_data, cat_genotype)
+count_table (ntm_data, cat_genotype, group = ntm_disease)
+fisher.test(ntm_data$cat_genotype, ntm_data$ntm_disease)
+
+# ------------- Pancreatic insufficiency
+count_table (ntm_data, pancreatic_therapy)
+count_table (ntm_data, pancreatic_therapy, group = ntm_disease)
+fisher.test(ntm_data$pancreatic_therapy, ntm_data$ntm_disease)
+
+# ------------- CF-diabetes
+count_table (ntm_data, isolation_diabetes)
+count_table (ntm_data, isolation_diabetes, 
+             group = ntm_disease)
+fisher.test(ntm_data$isolation_diabetes, ntm_data$ntm_disease)
+```
+
+# Analysis of clinical variables
+
+## Body mass Index (BMI)
+
+To minimize identifiers, raw data was changed to categorical bins according to BMI interpretation. 
+
+```{r body mass index}
+
+# 1 missing value
+is.na(ntm_data$bmi_baseline) %>%  sum() 
+
+# proportion table
+count_table(ntm_data, 
+            bmi_baseline, 
+            ntm_disease,
+            keep_na = F)
+
+# no significant differences
+fisher.test(x = ntm_data$bmi_baseline,
+            y = ntm_data$ntm_disease,
+            simulate.p.value = T)
+
+# no significant differences using raw data, not shown
+```
+
+## Lung function summary
+
+### Forced expiratory volume in 1 second (FEV1)
+
+Summary of FEV1 volume in liters at baseline
+
+```{r}
+# roughly normal distribution
+qqnorm(ntm_data$base_mean_FEV1_L) ; qqline(ntm_data$base_mean_FEV1_L, col="red")
+
+# summarize as median (IQR) due to small sample size
+quantile(ntm_data$base_mean_FEV1_L, na.rm = T)
+
+ntm_data %>%
+  quant_summary(., variable = base_mean_FEV1_L, group = ntm_disease) 
+
+wilcox.test(ntm_data$base_mean_FEV1_L ~ ntm_data$ntm_disease)
+# no significant differences ~ NTM_disease
+```
+
+We have the summary of lung function measurements from 2 years before the first
+positive NTM culture as the baseline for percent predicted pulmonary function
+test. Adjusted measurements were calculated using the GLI 2012 equations. In
+this section, I summarize the measurements for percent predicted FEV1 (ppFEV1)
+
+```{r}
+# A sample is missing baseline ppFEV1
+ntm_data %>% filter(is.na(base_ppFEV))
+
+# global summary excluding NA
+ntm_data %>% 
+  quant_summary(data = .,
+                group = ntm_disease, 
+                variable = base_ppFEV)
+
+
+# no apparent significant differences in baseline ppFEV
+t.test(ntm_data$base_ppFEV ~ ntm_data$ntm_disease)
+
+# boxplat of baseline FEV1 values
+ntm_data %>% 
+  ggplot(aes(x = ntm_disease,
+             y = base_ppFEV,
+             fill = ntm_disease)) +
+  geom_boxplot() +
+  geom_jitter() +
+  scale_fill_manual(values=c("blue1", "red")) +
+  labs (fill="NTM disease",
+        x="",
+        y="pp FEV1 at baseline")
+
+```
+
+### Forced Vital Capacity (FVC)
+
+The same participant has missing data for FVC. There are no significant
+differences at baseline either
+
+```{r}
+# sample participant has no FVC data
+ntm_data %>% filter(is.na(base_ppFVC))
+
+# global summary excluding NA and t-test
+ntm_data %>% 
+  quant_summary(data = .,
+                group = ntm_disease, 
+                variable = base_ppFVC)
+t.test(ntm_data$base_ppFVC ~ ntm_data$ntm_disease)
+
+```
+
+## Azythromycin use and steroid exposure
+
+There is a large proportion of *NA* values in steroids/macrolides exposure
+variables
+
+```{r}
+ntm_data %>% 
+  select(matches("steroid|macrolide")) %>% 
+  is.na() %>% 
+  colSums()
+```
+
+We summarized the more relevant definitions of exposure at NTM growth: -
+`steroids_oral_1m_growth` - `macrolides_3m_growth`
+
+```{r}
+
+# ------------- Oral steroids
+count_table(ntm_data, oral_steroid_1m_growth)
+count_table(ntm_data, oral_steroid_1m_growth,
+             group = ntm_disease)
+fisher.test(ntm_data$oral_steroid_1m_growth, 
+            ntm_data$ntm_disease)
+
+
+# ------------- Macrolides
+count_table(ntm_data, macrolide_3m_growth)
+count_table(ntm_data, macrolide_3m_growth,
+             group = ntm_disease)
+fisher.test(ntm_data$macrolide_3m_growth, 
+            ntm_data$ntm_disease)
+```
+
+# Analysis of NTM culture data
+
+## Mycobacterial cultures
+
+Now, we will show the distribution of NTM species in our dataset. The categories
+are grouped as MAC, MABs, and others. Another variable
+`mycobacteria_species_ungrouped` expands the species contained in the **other**
+category.
+
+```{r}
+ntm_data %>% 
+  count_table(var = mycobacteria_species,
+              group = ntm_disease)
+
+
+fisher.test(ntm_data$mycobacteria_species,
+            ntm_data$ntm_disease)
+```
+
+Barplot of mycobacterial species distribution in the full cohort. The three
+different groups and their relative percentage in the sample are represented in
+the Y-axis.
+
+```{r}
+
+ntm_data %>% 
+  count_table(mycobacteria_species) %>%
+  ggplot(aes(x = mycobacteria_species, y = prop)) +
+  geom_col(
+    position = position_dodge2(preserve = "single", padding = 0.05),
+    fill=c("brown4", "purple4", "grey45")) + 
+  geom_text(
+    aes(label = prop, 
+        fontface = "bold", 
+        vjust = 1.5, 
+        hjust = 0.5),
+    size = 5,
+    color = "white",
+    position = position_dodge2(width = 0.92))  +
+  labs(title = ~italic("Mycobacteria")~"spp.",
+       fill = "NTM-PD") +
+  theme_classic() +
+  theme(axis.text = element_text(size = 12),
+        axis.title = element_blank(),
+        legend.position = "none", 
+        plot.title = element_text(hjust = 0.5))
+```
+
+This plot represents the distribution of NTM species in those that progressed or
+not to NTM-PD.
+
+```{r}
+
+ntm_data %>% 
+  count_table(mycobacteria_species, ntm_disease)  %>% 
+  ggplot(aes(x = mycobacteria_species, 
+             y = prop,
+             fill = ntm_disease)) +
+  geom_col(
+    position = position_dodge2(preserve = "single", padding = 0.05)) +
+  geom_text(aes(label = prop, 
+                fontface="bold",
+                vjust = 1.5, 
+                hjust=0.5),
+            size = 5, 
+            color = "white",
+            position = position_dodge2(width = 0.92))  +
+  scale_fill_manual(values = c("blue3", "red3")) +
+  labs(title = "Mycobacteria spp.",
+       fill = "NTM-PD") +
+  theme_classic() +
+  theme(axis.text = element_text(size = 12),
+        axis.title = element_blank(),
+        legend.position = "right", 
+        plot.title = element_text(hjust = 0.5, face = "italic"),
+        strip.background = element_blank(),
+        strip.text.x = element_blank()
+        ) +
+  facet_wrap(~ntm_disease)
+```
+
+## Other pathogens
+
+As we will produce several plots for each relevant pathogen, I design a wrapper
+function to quickly create barplots by NTM-PD outcome group
+
+```{r wrapper function for counts of respiratory pathogens}
+
+# Barplot comparing respiratory pathogen frequency by NTM-PD outcome
+
+pathogen_barplot <- function(var, title, 
+                             ylab=NULL, xlab=NULL) {
+  ## var is variable with pathogen data 
+  ## ylab determines the label of the y axis
+  ntm_data %>%  
+    select(starts_with("chronic"), ntm_disease) %>% 
+    count_table({{var}}, group = ntm_disease) %>% 
+    filter({{var}}=="Yes") %>%
+    ggplot(aes(x = ntm_disease,
+               y = n,
+               fill = ntm_disease,
+               label = paste0(prop, " %"))) +
+    geom_col(position = "dodge2") +
+    labs(y = ylab,
+         x = xlab,
+         title = title) +
+    scale_fill_manual(values=c("blue", "red2")) +
+    geom_text(position = position_dodge(width = .9),
+              # move to center of bars
+              vjust = 1.3,
+              # nudge above top of bar
+              size = 4, color = "white", fontface ="bold") +
+    theme(axis.text = element_text(size = 12),
+          axis.title = element_text(size = 14),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "none")
+}
+```
+
+Now, we create the plots and summarize the raw numbers and statistical
+differences among NTM-PD groups
+
+```{r}
+# ------------- Pseudomonas
+
+pathogen_barplot(var = chronic_pseudomonas, title = "Pseudomonas spp.",
+                 ylab = "Percentage with chronic infection",
+                 xlab= "NTM-PD")
+
+fisher.test(ntm_data$chronic_pseudomonas, ntm_data$ntm_disease)
+
+# summary table
+ntm_data %>% count_table(., group = ntm_disease, keep_na = F,
+                         var = chronic_pseudomonas)
+
+# ------------- Stenothrophomonas
+
+pathogen_barplot(var = chronic_stenotrophomonas, 
+                 title = "Stenotrophomonas spp.",
+                 ylab = "Percentage with chronic infection",
+                 xlab= "NTM-PD")
+
+fisher.test(ntm_data$chronic_stenotrophomonas, ntm_data$ntm_disease)
+
+# summary table
+ntm_data %>% count_table(., group = ntm_disease, keep_na = F,
+                         var = chronic_stenotrophomonas)
+
+# ------------- Burkholderia
+
+pathogen_barplot(var = chronic_burkholderia, title = "Burkholderia spp.",
+                 ylab = "Percentage with chronic infection",
+                 xlab= "NTM-PD")
+
+fisher.test(ntm_data$chronic_burkholderia, ntm_data$ntm_disease)
+
+# summary table
+ntm_data %>% count_table(., group = ntm_disease, keep_na = F,
+                         var = chronic_burkholderia)
+
+# ------------- Aspergillus
+
+pathogen_barplot(var = chronic_aspergillus, title = "Aspergillus spp.",
+                 ylab = "Percentage with chronic infection",
+                 xlab= "NTM-PD")
+
+fisher.test(ntm_data$chronic_aspergillus, ntm_data$ntm_disease)
+
+# summary table
+ntm_data %>% count_table(., group = ntm_disease, keep_na = F,
+                         var = chronic_aspergillus)
+
+```
+
+# Complementary analyses
+
+## Distribution of outcome groups with alternative categories
+
+Categories include:
+
+-   Spontaneous clearance (clear of NTM after one year of negative cultures)
+-   Chronic colonization (NTM recovery with every AFB culture)
+-   Intermittent colonization (NTM not recovered from every AFB culture, but
+    rather intermittently)
+
+```{r}
+
+table(ntm_data$ntm_alt_categories)
+
+```
+
+## Cohort characteristics by NTM species
+
+We will explore the clinical and demographic characteristics of patients infected with MABs and MACs. Statistical comparisons are performed by type of NTM
+
+```{r}
+ mac_mabs_data <- 
+  ntm_data %>%
+  filter(mycobacteria_species %in% c("MAC", "MABs"))
+
+# QC - NTM species distribution
+table(mac_mabs_data$mycobacteria_species)
+```
+
+### Demographic variables
+
+```{r}
+
+# ------------ NTM-PD
+
+count_table(data= mac_mabs_data,
+            var = ntm_disease,
+            group = mycobacteria_species)
+fisher.test(ntm_data$mycobacteria_species, ntm_data$ntm_disease)
+
+
+# ------------- age
+count_table(mac_mabs_data, age_cat)
+fisher.test(mac_mabs_data$age_cat, mac_mabs_data$mycobacteria_species)
+
+# ------------- Female sex
+count_table (mac_mabs_data, female, group = mycobacteria_species)
+fisher.test(mac_mabs_data$female, mac_mabs_data$mycobacteria_species)
+
+# ------------- Genotype
+count_table (mac_mabs_data, cat_genotype, group = mycobacteria_species)
+fisher.test(mac_mabs_data$cat_genotype, mac_mabs_data$mycobacteria_species)
+
+# ------------- Pancreatic insufficiency
+count_table (mac_mabs_data, pancreatic_therapy, group = mycobacteria_species)
+fisher.test(mac_mabs_data$pancreatic_therapy, mac_mabs_data$mycobacteria_species)
+
+# ------------- CF-diabetes
+count_table (mac_mabs_data, isolation_diabetes, 
+             group = mycobacteria_species)
+fisher.test(mac_mabs_data$isolation_diabetes, mac_mabs_data$mycobacteria_species)
+
+```
+
+### Clinical variables
+
+```{r}
+
+# ------------- BMI
+
+is.na(mac_mabs_data$bmi_baseline) %>% 
+  sum()
+
+count_table(data = mac_mabs_data, 
+            var = bmi_baseline, 
+            group = mycobacteria_species,
+            keep_na = F)
+
+# nonsignificant differences
+fisher.test(x = mac_mabs_data$bmi_baseline,
+            y = mac_mabs_data$mycobacteria_species)
+
+# -------------- Baseline ppFEV1
+
+quant_summary(data=mac_mabs_data, 
+              group = mycobacteria_species, 
+              variable = base_ppFEV)
+
+# pairwise comparison
+qqnorm(mac_mabs_data$base_ppFEV) ; qqline(mac_mabs_data$base_ppFEV, col="red")
+wilcox.test(mac_mabs_data$base_ppFEV ~ mac_mabs_data$mycobacteria_species)
+
+# ------------- Oral steroids
+
+is.na(mac_mabs_data$oral_steroid_1m_growth) %>% sum()
+count_table(mac_mabs_data, oral_steroid_1m_growth,
+             group = mycobacteria_species)
+
+# pairwise comparison
+fisher.test(mac_mabs_data$oral_steroid_1m_growth, 
+            mac_mabs_data$mycobacteria_species)
+
+# ------------- Macrolides
+
+is.na(mac_mabs_data$macrolide_3m_growth) %>%   sum()
+count_table(mac_mabs_data, macrolide_3m_growth,
+             group = mycobacteria_species)
+
+# pairwise comparison
+fisher.test(mac_mabs_data$macrolide_3m_growth, 
+            mac_mabs_data$mycobacteria_species)
+```
+# Produce a dataset for RNAseq analysis
+
+I create a variable to define different batches of RNA extraction according to
+date, keep important variables to adjust in the RNA-seq analysis.
+
+```{r, eval=FALSE}
+# colnames(ntm_data)
+
+ntm_data %>% 
+  dplyr::select(
+    c(CFB_study_id, mycobacteria_species, 
+      CF_related_disorder, transplant, 
+      female, cftr_modulator, 
+      chronic_aspergillus, chronic_pseudomonas, 
+      cat_genotype, batch_extraction, 
+      ntm_disease, transient_inf, 
+      rna_growth_window, rna_disease_window, 
+      rna_disease_interval, rna_growth_interval,
+      age_cat)) %>% 
+  write_csv(file = "./clinical_rnaseq.csv")
+
+```
+
+# Save session information
+
+```{r}
+sessionInfo()
+```
